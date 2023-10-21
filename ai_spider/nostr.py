@@ -71,3 +71,11 @@ def decrypt_message(ciphertext, pubkey):
 
 def gen_random_string():
     return ''.join(random.choice(string.ascii_letters) for i in range(10))
+
+async def get_from_queue():
+    global g_relay_manager
+
+    while True:
+        e = await g_relay_manager.message_pool.get_event()
+        await asyncio.sleep(1)
+        yield e

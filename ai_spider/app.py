@@ -36,7 +36,7 @@ from .files import app as file_router  # Adjust the import path as needed
 from .util import get_bill_to, BILLING_URL, BILLING_TIMEOUT
 
 from nostr.event import Event
-from .nostr import nostr_connect, subscribe, decrypt_message, get_dm
+from .nostr import nostr_connect, subscribe, decrypt_message, get_dm, get_from_queue
 
 log = logging.getLogger(__name__)
 
@@ -763,12 +763,13 @@ async def worker_connect(event: Event):
             break
     mgr.drop_worker(connection)
 
+
+
 async def nostr_stuff():
     nostr_connect()
     subscribe()
-    while True:
-        await asyncio.sleep(0.1)
-        plaintext = get_dm()
-        print(f'plaintext: {plaintext}')
-        
-asyncio.run(nostr_stuff())
+    async for e in get_from_queue():
+        print(e)
+
+event_loop = asyncio.get_event_loop()
+asyncio.ensure_future(nostr_stuff(), loop=event_loop)

@@ -21,7 +21,7 @@ boto3-stubs = {extras = ["essential"], version = "^1.28.56"}
 gunicorn = "^21.2.0"
 notanorm = "^3.9.1"
 pymysql = "^1.1.0"
-nostr = { git = "git@github.com:jeffthibault/python-nostr.git", branch = "main" }
+nostr = {git = "ssh://git@github.com/lnconsole/python-nostr", rev = "conxole"}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.2"
