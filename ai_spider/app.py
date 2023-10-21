@@ -35,6 +35,9 @@ from .stats import StatsContainer, PUNISH_SECS, StatsStore
 from .files import app as file_router  # Adjust the import path as needed
 from .util import get_bill_to, BILLING_URL, BILLING_TIMEOUT
 
+from nostr.event import Event
+from .nostr import nostr_connect, subscribe, decrypt_message, get_dm
+
 log = logging.getLogger(__name__)
 
 load_dotenv()
@@ -64,7 +67,6 @@ app.add_middleware(
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
 init_log()
-
 
 # change to "error" from "detail" to be compat with openai
 
@@ -354,7 +356,7 @@ def adjust_model_for_worker(model, info) -> str:
     return alt["hf"]
 
 
-async def do_inference(request: Request, body: CreateChatCompletionRequest, ws: "QueueSocket"):
+async def do_inference(request: Request, body: CreateChatCompletionRequest, ws: "QueueConnection"):
     # be sure we don't alter the original request, so it can be retried
     body = body.model_copy()
 
@@ -499,6 +501,13 @@ class QueueSocket(WebSocket):
     results: Queue
     info: dict
 
+class QueueConnection():
+    queue: Queue
+    results: Queue
+    info: dict
+
+    async def receive_json():
+        None
 
 def anon_info(ent, **fin):
     info = ent.info
@@ -522,12 +531,12 @@ class WorkerManager:
         # im actually using it
         self.very_busy = set()
 
-    def register_js(self, sock: QueueSocket, info: dict):
-        self.socks[sock] = info
+    def register_js(self, queue: QueueConnection, info: dict):
+        self.socks[queue] = info
 
-    def drop_worker(self, sock):
-        self.socks.pop(sock, None)
-        self.busy.pop(sock, None)
+    def drop_worker(self, pubkey: str):
+        self.socks.pop(pubkey, None)
+        self.busy.pop(pubkey, None)
 
     @contextlib.contextmanager
     def get_socket_for_inference(self, msize: int, worker_type: str, gpu_filter={}) -> Generator[
@@ -682,47 +691,38 @@ def get_ip(request: HTTPConnection):
     return ip
 
 
-def validate_worker_info(js):
+def validate_worker_info(js) -> bool:
     pk = js.get("pubkey", None)
     sig = js.pop("sig", None)
-    # todo: raise an error if invalid sig
+
+    return pk != None and sig != None
 
 
-@app.websocket("/worker")
-async def worker_connect(websocket: WebSocket):
-    # request dependencies don't work with websocket, so just roll our own
-    try:
-        await websocket.accept()
-        js = await websocket.receive_json()
-    except (websockets.ConnectionClosedOK, RuntimeError, starlette.websockets.WebSocketDisconnect) as ex:
-        log.debug("aborted connection before message: %s", repr(ex))
+# @app.websocket("/worker")
+# async def worker_connect(websocket: WebSocket):
+async def worker_connect(event: Event):
+    decrypted = decrypt_message(event.content, event.public_key)
+    js = json.loads(decrypted)
+
+    if not validate_worker_info(js):
         return
 
-    websocket = cast(QueueSocket, websocket)
-
-    validate_worker_info(js)
-
-    # turn it into a queuesocket by adding "info" and a queue
-    websocket.info = js
-
-    # get the source ip, for long-term punishment of bad actors
-    req = HTTPConnection(websocket.scope)
-    websocket.info["ip"] = get_ip(req)
-
-    websocket.queue = Queue()
-    websocket.results = Queue()
+    connection = QueueConnection()
+    connection.queue = Queue()
+    connection.results = Queue()
+    connection.info = js
 
     # debug: log everything
-    log.debug("connected: %s", websocket.info)
+    log.debug("connected: %s", connection.info)
 
     mgr = get_reg_mgr()
-    mgr.register_js(sock=websocket, info=js)
+    mgr.register_js(queue=connection, info=js)
 
-    g_stats.queue_load(websocket)
+    g_stats.queue_load(connection)
 
     while True:
         try:
-            pending = [asyncio.create_task(ent) for ent in [websocket.queue.get(), websocket.receive_json()]]
+            pending = [asyncio.create_task(ent) for ent in [connection.queue.get(), connection.receive_json()]]
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for fut in done:
                 try:
@@ -731,18 +731,20 @@ async def worker_connect(websocket: WebSocket):
                     # could distinguish them above with some intermediate functions that return tuples, but no need yet
                     if "openai_req" in action:
                         log.info("action %s", action)
-                        while not websocket.results.empty():
-                            websocket.results.get_nowait()
-                        await websocket.send_json(action)
+                        while not connection.results.empty():
+                            connection.results.get_nowait()
+
+                        #TODO: send DM
+                        # await websocket.send_json(action)
                     elif "busy" in action:
                         log.info("action %s", action)
-                        mgr.set_busy(websocket, action.get("busy"))
+                        mgr.set_busy(connection, action.get("busy"))
                     else:
                         log.debug("action %s", action)
-                        await websocket.results.put(action)
+                        await connection.results.put(action)
                 except JSONDecodeError:
                     log.warning("punish worker failure")
-                    punish_failure(websocket, "json decode error")
+                    punish_failure(connection, "json decode error")
                     # continue so we don't get a new ws, and lose stats
                     # todo: do this by inbound ip instead of ws handle, so they persist across connections
                     # then we can disconnect here if we want, and even block reconn for a while
@@ -759,4 +761,14 @@ async def worker_connect(websocket: WebSocket):
         except (websockets.ConnectionClosedOK, RuntimeError, starlette.websockets.WebSocketDisconnect):
             log.info("dropped worker")
             break
-    mgr.drop_worker(websocket)
+    mgr.drop_worker(connection)
+
+async def nostr_stuff():
+    nostr_connect()
+    subscribe()
+    while True:
+        await asyncio.sleep(0.1)
+        plaintext = get_dm()
+        print(f'plaintext: {plaintext}')
+        
+asyncio.run(nostr_stuff())
