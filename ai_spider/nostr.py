@@ -6,42 +6,40 @@ import random
 import string
 import logging
 import asyncio
+
 from collections.abc import Callable
-
-
 from nostr.relay_manager import RelayManager
 from nostr.key import PrivateKey
 from nostr.filter import Filter, Filters
-from nostr.event import Event, EventKind
+from nostr.event import Event, EventKind, EncryptedDirectMessage
 
 log = logging.getLogger(__name__)
 
 g_private_key = None
 g_relay_manager = None
 
-def nostr_connect():
+async def nostr_connect():
     global g_private_key, g_relay_manager
 
     g_private_key = PrivateKey.from_nsec(os.environ["NOSTR_SK"])
     g_relay_manager = RelayManager()
-    g_relay_manager.add_relay("wss://relay.conxole.io")
+    g_relay_manager.add_relay(os.environ["NOSTR_RELAY"])
     log.info(
-        "[nostr] connecting to relays",
+        "[nostr] connecting to relay",
     )
-    time.sleep(2)
+    await asyncio.sleep(2)
 
-def subscribe():
+async def subscribe():
     global g_relay_manager, g_private_key
 
-    log.info(
-        "[nostr] init sub",
-    )
+    now = int(time.time())
 
     filters = Filters(
         [
             Filter(
                 kinds=[4],
-                pubkey_refs=[g_private_key.public_key.hex()]
+                pubkey_refs=[g_private_key.public_key.hex()],
+                since=now,
             )
         ]
     )
@@ -49,19 +47,21 @@ def subscribe():
     log.info(
         "[nostr] subscribing",
     )
-    time.sleep(2)
+    await asyncio.sleep(2)
 
-def get_dm():
-    global g_relay_manager, g_private_key
-    while True:
-        event_msg = g_relay_manager.message_pool.get_event()
-        print("got event: ", event_msg.event)
-        if event_msg.event.kind == EventKind.ENCRYPTED_DIRECT_MESSAGE:
-            dm = g_private_key.decrypt_message(
-                encoded_message=event_msg.event.content, 
-                public_key_hex=event_msg.event.public_key
-            )
-            return dm
+def publish_dm(pubkey, content):
+    global g_private_key, g_relay_manager
+
+    print("publishing")
+
+    dm = EncryptedDirectMessage(
+        recipient_pubkey=pubkey,
+        cleartext_content=content
+    )
+    g_private_key.sign_event(dm)
+    g_relay_manager.publish_event(dm)
+
+    return
 
 
 def decrypt_message(ciphertext, pubkey):
@@ -70,12 +70,14 @@ def decrypt_message(ciphertext, pubkey):
     return g_private_key.decrypt_message(ciphertext, pubkey)
 
 def gen_random_string():
+    '''
+    Get a random string to use as a subscription ID.
+    '''
     return ''.join(random.choice(string.ascii_letters) for i in range(10))
 
-async def get_from_queue():
+async def event_queue():
     global g_relay_manager
 
     while True:
-        e = await g_relay_manager.message_pool.get_event()
-        await asyncio.sleep(1)
-        yield e
+        event_msg = await g_relay_manager.message_pool.get_event()
+        yield event_msg.event

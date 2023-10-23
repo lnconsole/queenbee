@@ -36,7 +36,7 @@ from .files import app as file_router  # Adjust the import path as needed
 from .util import get_bill_to, BILLING_URL, BILLING_TIMEOUT
 
 from nostr.event import Event
-from .nostr import nostr_connect, subscribe, decrypt_message, get_dm, get_from_queue
+from .nostr import nostr_connect, subscribe, decrypt_message, event_queue, publish_dm
 
 log = logging.getLogger(__name__)
 
@@ -505,9 +505,11 @@ class QueueConnection():
     queue: Queue
     results: Queue
     info: dict
+    pubkey: str
 
-    async def receive_json():
-        None
+    async def receive_json(self):
+        content = await worker_update_q.get()
+        return content
 
 def anon_info(ent, **fin):
     info = ent.info
@@ -692,31 +694,23 @@ def get_ip(request: HTTPConnection):
 
 
 def validate_worker_info(js) -> bool:
-    pk = js.get("pubkey", None)
-    sig = js.pop("sig", None)
+    w_version = js.get("worker_version", None)
+    w_id = js.pop("worker_id", None)
 
-    return pk != None and sig != None
+    return w_version != None and w_id != None
 
-
-# @app.websocket("/worker")
-# async def worker_connect(websocket: WebSocket):
-async def worker_connect(event: Event):
-    decrypted = decrypt_message(event.content, event.public_key)
-    js = json.loads(decrypted)
-
-    if not validate_worker_info(js):
-        return
-
+async def worker_connect(pubkey, worker_payload):
     connection = QueueConnection()
     connection.queue = Queue()
     connection.results = Queue()
-    connection.info = js
+    connection.info = worker_payload
+    connection.pubkey = pubkey
 
     # debug: log everything
     log.debug("connected: %s", connection.info)
 
     mgr = get_reg_mgr()
-    mgr.register_js(queue=connection, info=js)
+    mgr.register_js(queue=connection, info=worker_payload)
 
     g_stats.queue_load(connection)
 
@@ -733,9 +727,8 @@ async def worker_connect(event: Event):
                         log.info("action %s", action)
                         while not connection.results.empty():
                             connection.results.get_nowait()
+                        publish_dm(pubkey, json.dumps(action))
 
-                        #TODO: send DM
-                        # await websocket.send_json(action)
                     elif "busy" in action:
                         log.info("action %s", action)
                         mgr.set_busy(connection, action.get("busy"))
@@ -763,13 +756,27 @@ async def worker_connect(event: Event):
             break
     mgr.drop_worker(connection)
 
-
+worker_update_q = Queue()
 
 async def nostr_stuff():
-    nostr_connect()
-    subscribe()
-    async for e in get_from_queue():
-        print(e)
+    await nostr_connect()
+    await subscribe()
+    async for event in event_queue():
+        print(event)
+        if event.kind == 4:
+            await process_kind_4(event)
+
+async def process_kind_4(event: Event):
+    decrypted_content = decrypt_message(event.content, event.public_key)
+    json_content = json.loads(decrypted_content)
+    
+    if validate_worker_info(json_content):
+        event_loop = asyncio.get_event_loop()
+        asyncio.ensure_future(worker_connect(event.public_key, json_content), loop=event_loop)
+        return
+    else:
+        await worker_update_q.put(json_content)
+    
 
 event_loop = asyncio.get_event_loop()
 asyncio.ensure_future(nostr_stuff(), loop=event_loop)
